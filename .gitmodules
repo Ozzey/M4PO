@@ -1,6 +1,7 @@
 [submodule "isaaclab"]
 	path = isaaclab
-	url = /home/aditya/Desktop/Projects/M4PO/isaaclab
+	url = https://github.com/Ozzey/M4PO.git
+	branch = isaaclab-beta
 [submodule "unitree_sim_isaaclab_ref"]
 	path = unitree_sim_isaaclab_ref
 	url = https://github.com/unitreerobotics/unitree_sim_isaaclab.git
