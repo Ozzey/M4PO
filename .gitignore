@@ -1,0 +1,14 @@
+.DS_Store
+.codex
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+*.egg-info/
+*.pyc
+*.pyo
+
+m4po_datacollection/assets/
+m4po-inference/assets/model/
+isaaclab/datasets/
+isaaclab/logs/
