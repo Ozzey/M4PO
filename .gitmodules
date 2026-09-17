@@ -1,0 +1,3 @@
+[submodule "external/M3PO"]
+	path = external/M3PO
+	url = https://github.com/Ozzey/M3PO.git

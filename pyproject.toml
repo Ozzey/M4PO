@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "m4po"
+version = "0.1.0"
+description = "Reference implementation of Massively Multi-Task Multi-Embodiment Model-Based Policy Optimization."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = {text = "MIT"}
+authors = [
+  {name = "Aditya Narendra"},
+]
+dependencies = [
+  "numpy>=1.26",
+  "torch>=2.3,<2.13",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+clip = ["open-clip-torch>=2.26"]
+tracking = ["wandb>=0.28,<0.29"]
+
+[project.scripts]
+m4po-train = "m4po.train:main"
+m4po-benchmark = "m4po.evaluate:main"
+
+[tool.setuptools.packages.find]
+include = ["m4po*"]
+
+[tool.setuptools.package-data]
+m4po = ["*.yaml", "configs/*.yaml"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
