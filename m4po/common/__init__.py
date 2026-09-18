@@ -1,4 +1,11 @@
-from m4po.common.buffer import ObservationSpec, RolloutBatch, RolloutBuffer
+from m4po.common.buffer import (
+    Episode,
+    EpisodeReplayBuffer,
+    ObservationSpec,
+    ReplayBatch,
+    RolloutBatch,
+    RolloutBuffer,
+)
 from m4po.common.config import (
     CHECKPOINT_SCHEMA_VERSION,
     IMPLEMENTATION_ID,
@@ -10,8 +17,11 @@ from m4po.common.environment import environment_signature
 __all__ = [
     "CHECKPOINT_SCHEMA_VERSION",
     "IMPLEMENTATION_ID",
+    "Episode",
+    "EpisodeReplayBuffer",
     "M4POConfig",
     "ObservationSpec",
+    "ReplayBatch",
     "RolloutBatch",
     "RolloutBuffer",
     "environment_signature",

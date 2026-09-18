@@ -25,7 +25,7 @@ Observation = dict[str, np.ndarray]
 
 
 class OnlineTrainer:
-    """Collect fresh parallel rollouts and apply M4PO updates in paper order."""
+    """Run episodic replay learning or the explicit legacy on-policy trainer."""
 
     _RESUME_OVERRIDE_KEYS = frozenset(
         {
@@ -37,6 +37,8 @@ class OnlineTrainer:
             "device",
             "quiet",
             "resume_checkpoint",
+            "max_wall_time_seconds",
+            "save_replay",
         }
     )
 
@@ -116,13 +118,17 @@ class OnlineTrainer:
             raise ValueError("Resume checkpoint payload must be a mapping")
         if payload.get("implementation_id") != IMPLEMENTATION_ID:
             raise ValueError("Resume checkpoint has an incompatible implementation ID")
-        if payload.get("checkpoint_schema_version") != CHECKPOINT_SCHEMA_VERSION:
+        if payload.get("checkpoint_schema_version") not in (
+            2,
+            CHECKPOINT_SCHEMA_VERSION,
+        ):
             raise ValueError(
                 "Resume checkpoint has an incompatible checkpoint schema version"
             )
         saved_config = payload.get("cfg")
         if not isinstance(saved_config, Mapping):
             raise ValueError("Resume checkpoint does not contain a valid configuration")
+        saved_config = M4POConfig.from_checkpoint_dict(saved_config).to_dict()
         current_config = cfg.to_dict()
         mismatches = {
             key: (saved_config.get(key), current_config[key])
@@ -247,6 +253,10 @@ class OnlineTrainer:
             logger.close()
 
     def train(self) -> Path:
+        if self.cfg.learning_mode == "off_policy":
+            from m4po.trainer.off_policy_trainer import OffPolicyTrainer
+
+            return OffPolicyTrainer(self.cfg).train()
         cfg = self.cfg
         cfg.validate()
         set_seed(cfg.seed, cfg.torch_deterministic)

@@ -26,7 +26,20 @@ isaaclab_headless: true
 isaaclab_enable_cameras: false
 isaaclab_use_fabric: true
 total_steps: 512
+learning_mode: off_policy
+seed_steps: 16
+pretrain_updates: 2
+updates_per_step: 0.25
+replay_capacity: 2000
+batch_size: 8
+num_q: 5
+rho: 0.5
+policy_optimization_enabled: false
+policy_optimization_weight: 0.0
+exploration_bonus_enabled: false
+exploration_bonus_weight: 0.0
 rollout_steps: 8
+# Legacy on-policy update settings; unused in off-policy mode.
 updates_per_rollout: 1
 ppo_epochs: 1
 minibatch_size: 128
@@ -61,13 +74,13 @@ ppo_clip_ratio: 0.2
 ppo_target_kl: 0.02
 value_clip_ratio:
 critic_coef: 1.0
-entropy_coef: 0.0
+entropy_coef: 0.0001
 planner_samples: 8
 inverse_temperature: 1.0
 min_std: 0.05
 log_std_min: -5.0
 log_std_max: 2.0
-discrepancy_beta: 0.1
+discrepancy_beta: 0.0
 discrepancy_max: 2.0
 discrepancy_decay_fraction: 1.0
 normalization_epsilon: 0.000001

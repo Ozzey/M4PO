@@ -691,6 +691,8 @@ class MockVectorEnv:
                 "embodiment_id": embodiment_id,
                 "embodiment_name": self.embodiment_names[embodiment_id],
                 "success": bool(success),
+                "terminated": bool(success),
+                "truncated": bool(low_info.get("timeout", False)),
                 "control_repeat": repeat,
                 "low_level_steps_executed": len(low_level_rewards),
                 "low_level_rewards": low_level_rewards,

@@ -17,13 +17,26 @@ num_envs: 4
 max_episode_steps: 8
 control_repeats: 1,2
 task_context_mode: frozen
-total_steps: 32
-rollout_steps: 4
+total_steps: 64
+learning_mode: off_policy
+seed_steps: 16
+pretrain_updates: 2
+updates_per_step: 0.25
+replay_capacity: 2000
+batch_size: 8
+num_q: 5
+rho: 0.5
+policy_optimization_enabled: false
+policy_optimization_weight: 0.0
+exploration_bonus_enabled: false
+exploration_bonus_weight: 0.0
+rollout_steps: 8
+# Legacy on-policy update settings; unused in off-policy mode.
 updates_per_rollout: 1
 ppo_epochs: 1
 minibatch_size: 8
 eval_every: 0
-save_every: 32
+save_every: 64
 log_every: 16
 log_dir: artifacts/runs/mock_visual_smoke
 model_horizon: 2
@@ -53,13 +66,13 @@ ppo_clip_ratio: 0.2
 ppo_target_kl:
 value_clip_ratio:
 critic_coef: 1.0
-entropy_coef: 0.0
+entropy_coef: 0.0001
 planner_samples: 4
 inverse_temperature: 1.0
 min_std: 0.05
 log_std_min: -3.0
 log_std_max: 1.0
-discrepancy_beta: 0.05
+discrepancy_beta: 0.0
 discrepancy_max: 2.0
 discrepancy_decay_fraction: 1.0
 normalization_epsilon: 0.000001

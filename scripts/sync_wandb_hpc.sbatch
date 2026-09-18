@@ -46,6 +46,7 @@ WANDB_PROJECT="${WANDB_PROJECT:-m4po-isaaclab-forge}"
 WANDB_RUN_ID="${WANDB_RUN_ID:-m4po-forge-seed0-${TRAINING_JOB_ID}}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-M4PO Forge seed 0 - Slurm ${TRAINING_JOB_ID}}"
 WANDB_GROUP="${WANDB_GROUP:-forge-multitask}"
+CHECKPOINT_PATH="${M4PO_WANDB_CHECKPOINT:-${RUN_DIR}/checkpoints/latest.pt}"
 
 mkdir -p \
   "${HPC_ROOT}/envs" \
@@ -83,7 +84,7 @@ args=(
   --url-file "${RUN_DIR}/wandb_url.txt"
   --config "${RUN_DIR}/config_resolved.yaml"
   --benchmark "${RUN_DIR}/benchmark.json"
-  --checkpoint "${RUN_DIR}/checkpoints/latest.pt"
+  --checkpoint "${CHECKPOINT_PATH}"
   --training-job-id "${TRAINING_JOB_ID}"
   --entity "${WANDB_ENTITY}"
   --project "${WANDB_PROJECT}"

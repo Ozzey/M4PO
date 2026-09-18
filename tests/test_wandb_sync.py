@@ -8,6 +8,8 @@ import pytest
 from m4po.wandb_sync import (
     SyncCursor,
     _log_benchmark,
+    _final_environment_step,
+    _last_pretrain_update,
     _refresh_run_config,
     _wait_for_startup_inputs,
     _wandb_tags,
@@ -31,6 +33,57 @@ class FakeConfig(dict[str, object]):
     ) -> None:
         self.updates.append((values, allow_val_change))
         super().update(values)
+
+
+def test_demonstration_metrics_have_update_axis_not_online_step():
+    output = record_to_wandb({
+        "phase": "demonstration_pretraining", "step": 0,
+        "pretrain_updates": 200, "bc_loss": 0.12, "q_loss": 0.3,
+    })
+    assert output["environment_step"] == 0
+    assert output["pretrain_update"] == 200
+    assert output["pretrain/bc_loss"] == 0.12
+    assert "train/bc_loss" not in output
+
+
+def test_rolling_metrics_use_environment_steps_and_preserve_native_coverage():
+    result = record_to_wandb({
+        "step": 40000, "phase": "off_policy_training",
+        "train_success_rate_supported_tasks_20": 0.7,
+        "train_success_tasks": 2, "train_success_task_coverage": 0.01,
+        "train_success_episodes_in_window": 32,
+        "train_score_macro_20": 0.4, "train_score_task_coverage": 0.5,
+        "train_per_task": {
+            "mw-reach": {"success_rate_20": 0.8, "score_mean_20": 0.8},
+            "walker-stand": {"success_rate_20": None, "score_mean_20": 0.2},
+        },
+    })
+    assert result["environment_step"] == 40000
+    assert result["train/rolling_success_rate"] == 0.7
+    assert result["train/rolling_success_task_coverage"] == 0.01
+    assert result["train/rolling_success_episode_count"] == 32
+    assert result["train/rolling_normalized_score"] == 0.4
+    assert result["train/task/mw-reach/rolling_success_rate"] == 0.8
+    assert "train/task/walker-stand/rolling_success_rate" not in result
+
+
+def test_undefined_rolling_success_is_not_logged_as_zero():
+    result = record_to_wandb({
+        "step": 10000, "train_success_rate_supported_tasks_20": None,
+        "train_success_task_coverage": 0.0,
+    })
+    assert "train/rolling_success_rate" not in result
+    assert result["train/rolling_success_task_coverage"] == 0.0
+
+
+def test_pretrain_artifact_does_not_claim_online_budget(tmp_path):
+    metrics = tmp_path / "metrics.jsonl"
+    metrics.write_text(json.dumps({
+        "phase": "demonstration_pretraining", "step": 0,
+        "pretrain_updates": 200000,
+    }) + "\n")
+    assert _final_environment_step({"total_steps": 100000000}, metrics) == 0
+    assert _last_pretrain_update(metrics) == 200000
 
 
 class FakeRun:
@@ -177,6 +230,33 @@ def test_training_success_rate_has_clear_fractional_alias() -> None:
 
     assert payload["train/train_success_rate_20"] == 0.35
     assert payload["train/success_rate_20"] == 0.35
+
+
+def test_mmbench_score_is_logged_without_undefined_success(tmp_path: Path) -> None:
+    benchmark = tmp_path / "benchmark.json"
+    benchmark.write_text(json.dumps({
+        "score_mean": 0.3,
+        "success_rate": None,
+        "per_task": {"walker-stand": {"score_mean": 0.3, "success_rate": None}},
+        "action_timing": {"mean_ms": 12.0},
+    }))
+    run = FakeRun()
+    cursor = SyncCursor(run_id="mmbench-test", device=1, inode=2)
+    _log_benchmark(
+        run, benchmark, environment_step=40000,
+        cursor_path=tmp_path / "cursor.json", cursor=cursor,
+    )
+    history = run.records[0][0]
+    assert history["eval/score_mean"] == 0.3
+    assert history["eval/per_task/walker-stand/score_mean"] == 0.3
+    assert history["eval/action_timing/mean_ms"] == 12.0
+    assert "eval/success_rate" not in history
+    training = record_to_wandb({
+        "step": 1000, "train_score_mean_20": 0.2,
+        "train_success_rate_20": None,
+    })
+    assert training["train/score_mean_20"] == 0.2
+    assert "train/success_rate_20" not in training
 
 
 def test_frozen_benchmark_success_is_summary_and_final_history(

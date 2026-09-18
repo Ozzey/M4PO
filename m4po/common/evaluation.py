@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Mapping
 from copy import deepcopy
+from numbers import Integral
 from typing import Any
 
 import numpy as np
@@ -20,6 +21,86 @@ def _agent_task_contexts(agent: Any) -> np.ndarray | None:
     if hasattr(features, "detach"):
         features = features.detach().cpu().numpy()
     return np.asarray(features, dtype=np.float32)
+
+
+def _evaluation_pairs(
+    env: Any, num_tasks: int, num_embodiments: int, *, require_explicit: bool
+) -> list[tuple[int, int]]:
+    """Use the adapter's supported pairs instead of inventing missing robots."""
+
+    configured = getattr(env, "evaluation_pairs", None)
+    if configured is None:
+        if require_explicit:
+            raise ValueError("MMBench adapters must expose explicit evaluation_pairs")
+        return [
+            (task_id, embodiment_id)
+            for task_id in range(num_tasks)
+            for embodiment_id in range(num_embodiments)
+        ]
+    pairs: list[tuple[int, int]] = []
+    for raw_pair in configured:
+        if not isinstance(raw_pair, (tuple, list)) or len(raw_pair) != 2:
+            raise ValueError(
+                "evaluation_pairs entries must be (task_id, embodiment_id)"
+            )
+        if any(
+            isinstance(value, bool) or not isinstance(value, Integral)
+            for value in raw_pair
+        ):
+            raise ValueError("evaluation_pairs IDs must be integers")
+        pair = (int(raw_pair[0]), int(raw_pair[1]))
+        if not (0 <= pair[0] < num_tasks and 0 <= pair[1] < num_embodiments):
+            raise ValueError("evaluation_pairs IDs are out of range")
+        if pair in pairs:
+            raise ValueError("evaluation_pairs must not contain duplicate pairs")
+        pairs.append(pair)
+    if not pairs:
+        raise ValueError("evaluation_pairs must not be empty")
+    if {pair[0] for pair in pairs} != set(range(num_tasks)) or {
+        pair[1] for pair in pairs
+    } != set(range(num_embodiments)):
+        raise ValueError(
+            "evaluation_pairs must cover every configured task and embodiment"
+        )
+    return pairs
+
+
+def _episode_metric(info: Mapping[str, Any], name: str) -> float | None:
+    """Keep native scores and represent undefined success as JSON null."""
+
+    value = info.get(name)
+    if value is None:
+        return None
+    array = np.asarray(value)
+    if array.ndim != 0:
+        raise ValueError(f"Episode {name} must be a scalar")
+    scalar = float(array)
+    if not np.isfinite(scalar):
+        return None
+    if name == "success" and scalar not in (0.0, 1.0):
+        raise ValueError("Episode success must be boolean, zero, one, or undefined")
+    return scalar
+
+
+def _complete_mean(values: list[float | None]) -> float | None:
+    """Do not disguise a partially defined benchmark metric as a complete one."""
+
+    if not values or any(value is None for value in values):
+        return None
+    return float(np.mean(values))
+
+
+def _require_supported_pairs(
+    task_ids: np.ndarray,
+    embodiment_ids: np.ndarray,
+    expected_pairs: list[tuple[int, int]],
+) -> None:
+    actual = set(zip(task_ids.tolist(), embodiment_ids.tolist(), strict=True))
+    unsupported = sorted(actual - set(expected_pairs))
+    if unsupported:
+        raise ValueError(
+            f"Environment exposed unsupported evaluation pairs: {unsupported}"
+        )
 
 
 def _metadata(
@@ -114,7 +195,8 @@ def _evaluate_pairs_sequentially(
     expected_pairs: list[tuple[int, int]],
     per_pair_returns: dict[tuple[int, int], list[float]],
     per_pair_lengths: dict[tuple[int, int], list[int]],
-    per_pair_success: dict[tuple[int, int], list[float]],
+    per_pair_success: dict[tuple[int, int], list[float | None]],
+    per_pair_scores: dict[tuple[int, int], list[float | None]],
     episodes: int,
     deterministic: bool,
     num_envs: int,
@@ -191,9 +273,8 @@ def _evaluate_pairs_sequentially(
                 if len(per_pair_returns[pair]) < episodes:
                     per_pair_returns[pair].append(float(running_returns[index]))
                     per_pair_lengths[pair].append(int(running_lengths[index]))
-                    per_pair_success[pair].append(
-                        float(bool(info.get("success", False)))
-                    )
+                    per_pair_success[pair].append(_episode_metric(info, "success"))
+                    per_pair_scores[pair].append(_episode_metric(info, "score"))
                 running_returns[index] = 0.0
                 running_lengths[index] = 0
 
@@ -209,9 +290,7 @@ def _evaluate_pairs_sequentially(
                 raise ValueError(
                     "Environment changed task/embodiment metadata mid-episode"
                 )
-            _require_selected_pair(
-                next_task_ids, next_embodiment_ids, selected_pair
-            )
+            _require_selected_pair(next_task_ids, next_embodiment_ids, selected_pair)
             task_ids = next_task_ids
             embodiment_ids = next_embodiment_ids
             action_masks = next_action_masks
@@ -230,7 +309,17 @@ def evaluate_policy(
     if episodes <= 0:
         raise ValueError("episodes must be positive")
     eval_cfg = deepcopy(cfg)
-    eval_cfg.num_envs = max(1, int(cfg.num_tasks) * int(cfg.num_embodiments))
+    is_mmbench = str(getattr(cfg, "env", "")).lower().strip() == "mmbench"
+    if is_mmbench:
+        eval_cfg._mmbench_evaluation = True
+    # MMBench runs its sparse native task/robot assignments sequentially. Do
+    # not create thousands of workers for a nonexistent Cartesian product.
+    eval_cfg.num_envs = max(
+        1,
+        int(getattr(cfg, "mmbench_eval_num_envs", 1))
+        if is_mmbench
+        else int(cfg.num_tasks) * int(cfg.num_embodiments),
+    )
     env = make_vector_env(eval_cfg)
     try:
         num_envs = int(env.num_envs)
@@ -248,13 +337,29 @@ def evaluate_policy(
             raise ValueError(
                 "Environment names do not match its task/embodiment counts"
             )
-        if hasattr(agent, "action_dim") and int(agent.action_dim) != int(env.action_dim):
-            raise ValueError("Evaluation environment action dimension does not match the agent")
+        task_domains = getattr(env, "task_domains", None)
+        if task_domains is not None:
+            task_domains = list(task_domains)
+            if len(task_domains) != num_tasks or any(
+                not isinstance(domain, str) or not domain.strip()
+                for domain in task_domains
+            ):
+                raise ValueError(
+                    "Environment task_domains must name one domain per task"
+                )
+        if hasattr(agent, "action_dim") and int(agent.action_dim) != int(
+            env.action_dim
+        ):
+            raise ValueError(
+                "Evaluation environment action dimension does not match the agent"
+            )
         if (
             hasattr(agent, "observation_spec")
             and agent.observation_spec != env.observation_spec
         ):
-            raise ValueError("Evaluation environment observation spec does not match the agent")
+            raise ValueError(
+                "Evaluation environment observation spec does not match the agent"
+            )
 
         if expected_environment_signature is not None:
             actual_signature = environment_signature(
@@ -268,11 +373,9 @@ def evaluate_policy(
                     "action-token semantics do not match the checkpoint"
                 )
 
-        expected_pairs = [
-            (task_id, embodiment_id)
-            for task_id in range(num_tasks)
-            for embodiment_id in range(num_embodiments)
-        ]
+        expected_pairs = _evaluation_pairs(
+            env, num_tasks, num_embodiments, require_explicit=is_mmbench
+        )
         pair_labels = {
             pair: f"{task_names[pair[0]]}/{embodiment_names[pair[1]]}"
             for pair in expected_pairs
@@ -284,6 +387,7 @@ def evaluate_policy(
         per_pair_returns = {pair: [] for pair in expected_pairs}
         per_pair_lengths = {pair: [] for pair in expected_pairs}
         per_pair_success = {pair: [] for pair in expected_pairs}
+        per_pair_scores = {pair: [] for pair in expected_pairs}
         if bool(getattr(env, "sequential_evaluation", False)):
             _evaluate_pairs_sequentially(
                 agent,
@@ -292,6 +396,7 @@ def evaluate_policy(
                 per_pair_returns=per_pair_returns,
                 per_pair_lengths=per_pair_lengths,
                 per_pair_success=per_pair_success,
+                per_pair_scores=per_pair_scores,
                 episodes=episodes,
                 deterministic=deterministic,
                 num_envs=num_envs,
@@ -362,9 +467,8 @@ def evaluate_policy(
                     if len(per_pair_returns[pair]) < episodes:
                         per_pair_returns[pair].append(float(running_returns[index]))
                         per_pair_lengths[pair].append(int(running_lengths[index]))
-                        per_pair_success[pair].append(
-                            float(bool(info.get("success", False)))
-                        )
+                        per_pair_success[pair].append(_episode_metric(info, "success"))
+                        per_pair_scores[pair].append(_episode_metric(info, "score"))
                     running_returns[index] = 0.0
                     running_lengths[index] = 0
 
@@ -380,6 +484,9 @@ def evaluate_policy(
                     raise ValueError(
                         "Environment changed task/embodiment metadata mid-episode"
                     )
+                _require_supported_pairs(
+                    next_task_ids, next_embodiment_ids, expected_pairs
+                )
                 task_ids = next_task_ids
                 embodiment_ids = next_embodiment_ids
                 action_masks = next_action_masks
@@ -390,6 +497,7 @@ def evaluate_policy(
             returns = per_pair_returns[pair]
             lengths = per_pair_lengths[pair]
             successes = per_pair_success[pair]
+            scores = per_pair_scores[pair]
             per_pair[key] = {
                 "task": task_names[pair[0]],
                 "embodiment": embodiment_names[pair[1]],
@@ -397,13 +505,21 @@ def evaluate_policy(
                 "returns": returns,
                 "lengths": lengths,
                 "successes": successes,
+                "scores": scores,
                 "return_mean": float(np.mean(returns)) if returns else 0.0,
                 "return_std": float(np.std(returns)) if returns else 0.0,
                 "length_mean": float(np.mean(lengths)) if lengths else 0.0,
-                "success_rate": float(np.mean(successes)) if successes else 0.0,
+                "success_rate": _complete_mean(successes),
+                "success_defined_episodes": sum(
+                    value is not None for value in successes
+                ),
+                "score_mean": _complete_mean(scores),
+                "score_defined_episodes": sum(value is not None for value in scores),
             }
+            if task_domains is not None:
+                per_pair[key]["domain"] = task_domains[pair[0]]
 
-        per_task: dict[str, dict[str, float]] = {}
+        per_task: dict[str, dict[str, float | None]] = {}
         for task_name in task_names:
             records = [
                 record for record in per_pair.values() if record["task"] == task_name
@@ -412,11 +528,14 @@ def evaluate_policy(
                 "return_mean": float(
                     np.mean([record["return_mean"] for record in records])
                 ),
-                "success_rate": float(
-                    np.mean([record["success_rate"] for record in records])
+                "success_rate": _complete_mean(
+                    [record["success_rate"] for record in records]
+                ),
+                "score_mean": _complete_mean(
+                    [record["score_mean"] for record in records]
                 ),
             }
-        per_embodiment: dict[str, dict[str, float]] = {}
+        per_embodiment: dict[str, dict[str, float | None]] = {}
         for embodiment_name in embodiment_names:
             records = [
                 record
@@ -427,8 +546,11 @@ def evaluate_policy(
                 "return_mean": float(
                     np.mean([record["return_mean"] for record in records])
                 ),
-                "success_rate": float(
-                    np.mean([record["success_rate"] for record in records])
+                "success_rate": _complete_mean(
+                    [record["success_rate"] for record in records]
+                ),
+                "score_mean": _complete_mean(
+                    [record["score_mean"] for record in records]
                 ),
             }
 
@@ -441,25 +563,82 @@ def evaluate_policy(
         all_successes = [
             value for values in per_pair_success.values() for value in values
         ]
+        all_scores = [value for values in per_pair_scores.values() for value in values]
         embodiment_success = [
             record["success_rate"] for record in per_embodiment.values()
         ]
-        return {
+        result = {
             "episodes": len(all_returns),
             "episodes_per_pair": episodes,
             "returns": all_returns,
             "lengths": all_lengths,
             "successes": all_successes,
+            "scores": all_scores,
             "return_mean": float(np.mean(all_returns)) if all_returns else 0.0,
             "return_std": float(np.std(all_returns)) if all_returns else 0.0,
             "length_mean": float(np.mean(all_lengths)) if all_lengths else 0.0,
-            "success_rate": float(np.mean(all_successes)) if all_successes else 0.0,
-            "worst_embodiment_success": (
-                float(min(embodiment_success)) if embodiment_success else 0.0
+            "success_rate": _complete_mean(all_successes),
+            "success_defined_episodes": sum(
+                value is not None for value in all_successes
             ),
+            "worst_embodiment_success": (
+                float(min(embodiment_success))
+                if embodiment_success
+                and all(value is not None for value in embodiment_success)
+                else None
+            ),
+            "score_mean": _complete_mean(
+                [record["score_mean"] for record in per_task.values()]
+            ),
+            "score_defined_episodes": sum(value is not None for value in all_scores),
+            "score_aggregation": "mean_of_task_mean_scores",
             "per_pair": per_pair,
             "per_task": per_task,
             "per_embodiment": per_embodiment,
         }
+        if task_domains is not None:
+            per_domain = {}
+            for domain in dict.fromkeys(task_domains):
+                records = [
+                    per_task[name]
+                    for name, task_domain in zip(task_names, task_domains, strict=True)
+                    if task_domain == domain
+                ]
+                per_domain[domain] = {
+                    "task_count": len(records),
+                    "return_mean": _complete_mean(
+                        [record["return_mean"] for record in records]
+                    ),
+                    "success_rate": _complete_mean(
+                        [record["success_rate"] for record in records]
+                    ),
+                    "score_mean": _complete_mean(
+                        [record["score_mean"] for record in records]
+                    ),
+                }
+            result["per_domain"] = per_domain
+        if is_mmbench:
+            canonical_count = int(getattr(env, "benchmark_task_count", 200))
+            full_selected = (
+                bool(getattr(env, "benchmark_full_suite", False))
+                and num_tasks == canonical_count == 200
+            )
+            score_task_count = sum(
+                record["score_mean"] is not None for record in per_task.values()
+            )
+            result["benchmark_coverage"] = {
+                "canonical_task_count": canonical_count,
+                "selected_task_count": num_tasks,
+                "evaluated_task_count": len(per_task),
+                "score_task_count": score_task_count,
+                "domain_count": len(set(task_domains))
+                if task_domains is not None
+                else None,
+                "evaluated_pair_count": len(per_pair),
+                "full_suite_selected": full_selected,
+                "complete_score_coverage": score_task_count == num_tasks,
+                "full_suite": full_selected and score_task_count == 200,
+            }
+        return result
     finally:
         env.close()

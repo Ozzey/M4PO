@@ -60,6 +60,10 @@ def make_vector_env(cfg):
         from .isaaclab_env import make_isaaclab_vector_env
 
         return make_isaaclab_vector_env(cfg)
+    if env_name == "mmbench":
+        from .mmbench_env import make_mmbench_vector_env
+
+        return make_mmbench_vector_env(cfg)
     raise ValueError(
         f"Unknown environment {env_name!r}. The built-in environment is 'mock'; "
         "additional simulators must be registered as lazy adapters in m4po.envs.factory."

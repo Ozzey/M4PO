@@ -200,11 +200,23 @@ class StochasticMPPIPlanner:
                 rollout_embodiment_ids,
             )
 
-        terminal_value = model.value(
-            rollout_latent,
-            rollout_task_ids,
-            rollout_embodiment_ids,
-        ).reshape(batch_size, samples, 1)
+        if getattr(self.cfg, "learning_mode", "off_policy") == "off_policy":
+            terminal_action, _ = actor.sample_squashed(rollout_latent, rollout_mask)
+            terminal_value = model.q(
+                rollout_latent,
+                terminal_action,
+                rollout_mask,
+                rollout_task_ids,
+                rollout_embodiment_ids,
+                return_type="avg",
+            )
+        else:
+            terminal_value = model.value(
+                rollout_latent,
+                rollout_task_ids,
+                rollout_embodiment_ids,
+            )
+        terminal_value = terminal_value.reshape(batch_size, samples, 1)
         model_return = (
             model_return + (self.discount**self.horizon) * continuation * terminal_value
         )

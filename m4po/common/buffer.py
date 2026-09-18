@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Dict, Iterator, Mapping
 
 import numpy as np
@@ -488,3 +488,392 @@ class RolloutBuffer:
             embodiment_ids=stack("embodiment_ids", torch.long),
             action_masks=stack("action_masks", torch.float32),
         )
+
+
+@dataclass(frozen=True)
+class Episode:
+    """A completed worker episode with T transitions and T+1 observations."""
+
+    observations: TensorDict
+    actions: torch.Tensor
+    rewards: torch.Tensor
+    terminated: torch.Tensor
+    task_ids: torch.Tensor
+    embodiment_ids: torch.Tensor
+    action_masks: torch.Tensor
+
+    @property
+    def length(self) -> int:
+        return int(self.actions.shape[0])
+
+
+@dataclass(frozen=True)
+class ReplayBatch:
+    """Time-major replay sequences; ``valid`` excludes end-of-episode padding."""
+
+    observations: TensorDict
+    actions: torch.Tensor
+    rewards: torch.Tensor
+    terminated: torch.Tensor
+    task_ids: torch.Tensor
+    embodiment_ids: torch.Tensor
+    action_masks: torch.Tensor
+    valid: torch.Tensor
+
+    def to(self, device: str | torch.device) -> "ReplayBatch":
+        return ReplayBatch(
+            observations={
+                name: value.to(device) for name, value in self.observations.items()
+            },
+            **{
+                name: getattr(self, name).to(device)
+                for name in (
+                    "actions",
+                    "rewards",
+                    "terminated",
+                    "task_ids",
+                    "embodiment_ids",
+                    "action_masks",
+                    "valid",
+                )
+            },
+        )
+
+
+class EpisodeReplayBuffer:
+    """FIFO episode replay, uniformly sampled over retained transition starts.
+
+    Sequences never cross a reset. Short tails repeat the final observation and
+    context, with zero actions/rewards and a zero validity mask. Storage owns a
+    detached CPU copy, so environment buffers and autograd graphs are not retained.
+    """
+
+    def __init__(
+        self,
+        capacity: int,
+        horizon: int,
+        batch_size: int,
+        device: str | torch.device = "cpu",
+        seed: int = 0,
+        observation_spec: ObservationSpec | None = None,
+    ) -> None:
+        for name, value in (
+            ("capacity", capacity),
+            ("horizon", horizon),
+            ("batch_size", batch_size),
+        ):
+            if isinstance(value, bool) or int(value) != value or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        self.capacity = int(capacity)
+        self.horizon = int(horizon)
+        self.batch_size = int(batch_size)
+        self.device = torch.device(device)
+        self.observation_spec = observation_spec
+        self._episodes: list[Episode] = []
+        self._size = 0
+        self._signature: dict | None = None
+        self._generator = torch.Generator(device="cpu").manual_seed(seed)
+
+    def __len__(self) -> int:
+        return self._size
+
+    @property
+    def num_episodes(self) -> int:
+        return len(self._episodes)
+
+    @property
+    def can_sample(self) -> bool:
+        return bool(self._episodes)
+
+    def rng_state_dict(self) -> dict[str, torch.Tensor]:
+        return {"generator": self._generator.get_state().clone()}
+
+    def load_rng_state_dict(self, state: Mapping[str, torch.Tensor]) -> None:
+        if not isinstance(state, Mapping) or set(state) != {"generator"}:
+            raise ValueError("Replay RNG state must contain a generator state")
+        try:
+            self._generator.set_state(state["generator"].cpu())
+        except (AttributeError, TypeError, RuntimeError) as exc:
+            raise ValueError("Replay RNG state is invalid") from exc
+
+    def state_dict(self) -> dict[str, object]:
+        """Serialize completed episodes and sampling RNG, without GPU copies.
+
+        As with module state dictionaries, tensors share the immutable stored
+        episode data. Save synchronously before modifying the replay buffer.
+        Unfinished simulator episodes are deliberately not part of replay.
+        """
+
+        return {
+            "schema_version": 1,
+            "capacity": self.capacity,
+            "horizon": self.horizon,
+            "batch_size": self.batch_size,
+            "observation_spec": (
+                asdict(self.observation_spec)
+                if self.observation_spec is not None
+                else None
+            ),
+            "size": self._size,
+            "episodes": [
+                {
+                    "observations": dict(episode.observations),
+                    **{
+                        name: getattr(episode, name)
+                        for name in (
+                            "actions",
+                            "rewards",
+                            "terminated",
+                            "task_ids",
+                            "embodiment_ids",
+                            "action_masks",
+                        )
+                    },
+                }
+                for episode in self._episodes
+            ],
+            "rng_state": self.rng_state_dict(),
+        }
+
+    def load_state_dict(self, state: Mapping[str, object]) -> None:
+        """Validate a full snapshot before atomically replacing live replay."""
+
+        if (
+            not isinstance(state, Mapping)
+            or isinstance(state.get("schema_version"), bool)
+            or state.get("schema_version") != 1
+        ):
+            raise ValueError("Unsupported replay checkpoint schema_version")
+        for name in ("capacity", "horizon", "batch_size"):
+            value = state.get(name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value != getattr(self, name)
+            ):
+                raise ValueError(
+                    f"Replay checkpoint {name} does not match configured replay"
+                )
+        expected_spec = (
+            asdict(self.observation_spec) if self.observation_spec is not None else None
+        )
+        if state.get("observation_spec") != expected_spec:
+            raise ValueError("Replay checkpoint observation_spec does not match")
+        size = state.get("size")
+        if (
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or not 0 <= size <= self.capacity
+        ):
+            raise ValueError("Replay checkpoint size is invalid")
+        episodes = state.get("episodes")
+        if not isinstance(episodes, list):
+            raise ValueError("Replay checkpoint episodes must be a list")
+        staged = EpisodeReplayBuffer(
+            self.capacity,
+            self.horizon,
+            self.batch_size,
+            device=self.device,
+            observation_spec=self.observation_spec,
+        )
+        staged.load_rng_state_dict(state.get("rng_state"))
+        fields = {
+            "observations",
+            "actions",
+            "rewards",
+            "terminated",
+            "task_ids",
+            "embodiment_ids",
+            "action_masks",
+        }
+        for record in episodes:
+            if not isinstance(record, Mapping) or set(record) != fields:
+                raise ValueError("Replay checkpoint episode fields are invalid")
+            observations = record["observations"]
+            if (
+                not isinstance(observations, Mapping)
+                or any(
+                    not isinstance(value, torch.Tensor)
+                    for value in observations.values()
+                )
+                or any(
+                    not isinstance(record[name], torch.Tensor)
+                    for name in fields - {"observations"}
+                )
+            ):
+                raise ValueError("Replay checkpoint episodes must contain tensors")
+            episode = Episode(**record)
+            staged._validate_episode(episode)
+            if len(staged) + episode.length > self.capacity:
+                raise ValueError("Replay checkpoint episodes exceed capacity")
+            staged.add(episode)
+        if len(staged) != size:
+            raise ValueError(
+                "Replay checkpoint size disagrees with episode transitions"
+            )
+        self._episodes = staged._episodes
+        self._size = staged._size
+        self._signature = staged._signature
+        self._generator = staged._generator
+
+    def add(self, episode: Episode) -> None:
+        self._validate_episode(episode)
+
+        def copy(value: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+            return value.detach().to(device="cpu", dtype=dtype).clone().contiguous()
+
+        stored = Episode(
+            observations={
+                name: copy(value, torch.float32)
+                for name, value in episode.observations.items()
+            },
+            actions=copy(episode.actions, torch.float32),
+            rewards=copy(episode.rewards, torch.float32),
+            terminated=copy(episode.terminated, torch.float32),
+            task_ids=copy(episode.task_ids, torch.long),
+            embodiment_ids=copy(episode.embodiment_ids, torch.long),
+            action_masks=copy(episode.action_masks, torch.float32),
+        )
+        self._episodes.append(stored)
+        self._size += stored.length
+        while self._size > self.capacity:
+            self._size -= self._episodes.pop(0).length
+
+    def _validate_episode(self, episode: Episode) -> None:
+        if (
+            episode.actions.ndim != 2
+            or episode.actions.shape[0] <= 0
+            or episode.actions.shape[1] <= 0
+        ):
+            raise ValueError("Episode actions must have nonempty shape [T, A]")
+        length = episode.length
+        if length > self.capacity:
+            raise ValueError("An episode cannot exceed replay capacity")
+        if not episode.observations:
+            raise ValueError("Episode observations cannot be empty")
+        if self.observation_spec is not None:
+            self.observation_spec.validate(episode.observations)
+        for name, value in episode.observations.items():
+            if value.ndim < 2 or value.shape[0] != length + 1:
+                raise ValueError(f"Episode observation {name!r} must have T+1 entries")
+        for name in ("rewards", "terminated"):
+            if getattr(episode, name).shape != (length, 1):
+                raise ValueError(f"Episode {name} must have shape [T, 1]")
+        for name in ("task_ids", "embodiment_ids"):
+            value = getattr(episode, name)
+            if value.shape != (length + 1,):
+                raise ValueError(f"Episode {name} must have shape [T+1]")
+            if value.dtype not in (torch.int32, torch.int64) or torch.any(value < 0):
+                raise ValueError(f"Episode {name} must be non-negative integers")
+            if not torch.all(value == value[0]):
+                raise ValueError(
+                    f"Episode {name} cannot change across a context/reset boundary"
+                )
+        if episode.action_masks.shape != episode.actions.shape:
+            raise ValueError("Episode action masks must match actions")
+        values = {
+            **episode.observations,
+            "actions": episode.actions,
+            "rewards": episode.rewards,
+            "terminated": episode.terminated,
+            "action_masks": episode.action_masks,
+        }
+        if any(not torch.isfinite(value).all() for value in values.values()):
+            raise ValueError("Episode tensors must contain finite values")
+        masks = episode.action_masks
+        if torch.any((masks != 0) & (masks != 1)) or torch.any(masks.sum(-1) < 1):
+            raise ValueError(
+                "Episode action masks must be binary with at least one valid action"
+            )
+        if not torch.all(masks == masks[0]):
+            raise ValueError(
+                "Episode action masks cannot change across a context/reset boundary"
+            )
+        if torch.any(episode.actions.abs() > 1 + 1e-6):
+            raise ValueError("Normalized episode actions must lie in [-1, 1]")
+        if torch.any((episode.actions * (1 - masks)).abs() > 1e-7):
+            raise ValueError("Invalid action coordinates must be zero")
+        if torch.any((episode.terminated != 0) & (episode.terminated != 1)):
+            raise ValueError("Episode terminated must contain only zeros and ones")
+        if torch.any(episode.terminated[:-1] != 0):
+            raise ValueError(
+                "An episode cannot contain an internal terminal/reset boundary"
+            )
+        signature = {
+            name: tuple(value.shape[1:]) for name, value in episode.observations.items()
+        }
+        signature["action_dim"] = int(episode.actions.shape[-1])
+        if self._signature is not None and signature != self._signature:
+            raise ValueError("Replay episodes must share observation and action shapes")
+        self._signature = signature
+
+    def sample(self) -> ReplayBatch:
+        if not self.can_sample:
+            raise RuntimeError("Replay buffer has no completed episode to sample")
+        selections = torch.randint(
+            self._size, (self.batch_size,), generator=self._generator
+        ).numpy()
+        ends = np.cumsum([episode.length for episode in self._episodes])
+        indices = np.searchsorted(ends, selections, side="right")
+        starts = selections - np.where(indices > 0, ends[np.maximum(indices - 1, 0)], 0)
+        sequences: list[ReplayBatch] = []
+        for episode_index, start in zip(indices.tolist(), starts.tolist(), strict=True):
+            episode = self._episodes[episode_index]
+            length = min(self.horizon, episode.length - start)
+            end = start + length
+
+            def padded(
+                value: torch.Tensor,
+                *,
+                observations: bool = False,
+                fill: float | None = None,
+            ) -> torch.Tensor:
+                result = value[start : end + int(observations)]
+                padding = self.horizon - length
+                if not padding:
+                    return result
+                tail = result[-1:].expand(padding, *result.shape[1:])
+                if fill is not None:
+                    tail = torch.full_like(tail, fill)
+                return torch.cat((result, tail), dim=0)
+
+            sequences.append(
+                ReplayBatch(
+                    observations={
+                        name: padded(value, observations=True)
+                        for name, value in episode.observations.items()
+                    },
+                    actions=padded(episode.actions, fill=0),
+                    rewards=padded(episode.rewards, fill=0),
+                    terminated=padded(episode.terminated, fill=1),
+                    task_ids=padded(episode.task_ids, observations=True),
+                    embodiment_ids=padded(episode.embodiment_ids, observations=True),
+                    action_masks=padded(episode.action_masks),
+                    valid=torch.cat(
+                        (torch.ones(length, 1), torch.zeros(self.horizon - length, 1))
+                    ),
+                )
+            )
+        return ReplayBatch(
+            observations={
+                name: torch.stack(
+                    [batch.observations[name] for batch in sequences], dim=1
+                )
+                for name in sequences[0].observations
+            },
+            **{
+                name: torch.stack([getattr(batch, name) for batch in sequences], dim=1)
+                for name in (
+                    "actions",
+                    "rewards",
+                    "terminated",
+                    "task_ids",
+                    "embodiment_ids",
+                    "action_masks",
+                    "valid",
+                )
+            },
+        ).to(self.device)
+
+
+ReplayBuffer = EpisodeReplayBuffer

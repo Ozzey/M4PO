@@ -19,7 +19,12 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from m4po.common.buffer import ObservationSpec, RolloutBatch
+from m4po.common.buffer import (
+    EpisodeReplayBuffer,
+    ObservationSpec,
+    ReplayBatch,
+    RolloutBatch,
+)
 from m4po.common.config import CHECKPOINT_SCHEMA_VERSION, IMPLEMENTATION_ID, M4POConfig
 from m4po.common.layers import mlp, weight_init
 from m4po.common.losses import (
@@ -137,8 +142,28 @@ class ValueCritic(nn.Module):
         return self.network(latent)
 
 
+class RunningScale(nn.Module):
+    """EMA of the replay Q-value spread, used only to scale the actor loss."""
+
+    def __init__(self, decay: float, device: torch.device) -> None:
+        super().__init__()
+        self.decay = float(decay)
+        self.register_buffer("value", torch.ones((), device=device))
+
+    @torch.no_grad()
+    def update(self, values: torch.Tensor) -> None:
+        values = values.detach().float().reshape(-1)
+        if values.numel():
+            quantiles = torch.quantile(values, values.new_tensor([0.05, 0.95]))
+            estimate = (quantiles[1] - quantiles[0]).clamp_min(1.0)
+            self.value.lerp_(estimate, 1.0 - self.decay)
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        return values / self.value.detach().clone()
+
+
 class M4POAgent(nn.Module):
-    """Fresh-rollout M4PO agent with differentiable stochastic planning."""
+    """Hierarchical MPPI agent with replay learning and an explicit legacy PPO mode."""
 
     def __init__(
         self,
@@ -150,6 +175,7 @@ class M4POAgent(nn.Module):
         task_contexts: np.ndarray | torch.Tensor | None = None,
     ) -> None:
         super().__init__()
+        torch.set_float32_matmul_precision(cfg.matmul_precision)
         cfg.device = str(device)
         cfg.validate()
         self.observation_spec = observation_spec
@@ -164,27 +190,57 @@ class M4POAgent(nn.Module):
             cfg,
             task_contexts=task_contexts,
         ).to(device)
-        self.actor = GaussianActor(self.model.latent_dim, self.action_dim, cfg).to(device)
-        self.external_critic = ValueCritic(
-            self.model.latent_dim, cfg.mlp_dim, cfg.dropout
-        ).to(device)
-        self.augmented_critic = ValueCritic(
-            self.model.latent_dim, cfg.mlp_dim, cfg.dropout
-        ).to(device)
-        self.planner = StochasticMPPIPlanner(cfg)
-
-        world_parameters = [parameter for parameter in self.model.parameters() if parameter.requires_grad]
-        self.world_model_optimizer = torch.optim.Adam(world_parameters, lr=cfg.world_model_lr)
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor_lr, eps=1e-5)
-        self.critic_optimizer = torch.optim.Adam(
-            [*self.external_critic.parameters(), *self.augmented_critic.parameters()],
-            lr=cfg.critic_lr,
-            eps=1e-5,
+        self.actor = GaussianActor(self.model.latent_dim, self.action_dim, cfg).to(
+            device
         )
+        self.planner = StochasticMPPIPlanner(cfg)
+        self.actor_optimizer = torch.optim.Adam(
+            self.actor.parameters(), lr=cfg.actor_lr, eps=1e-5
+        )
+        if cfg.learning_mode == "off_policy":
+            self.scale = RunningScale(cfg.ema_decay, device)
+            # Off-policy planning bootstraps Q(z, pi(z)); the old V head is unused.
+            self.model.value_head.requires_grad_(False)
+            q_parameters = list(self.model.q_functions.parameters())
+            q_parameter_ids = {id(parameter) for parameter in q_parameters}
+            world_parameters = [
+                parameter
+                for parameter in self.model.parameters()
+                if parameter.requires_grad and id(parameter) not in q_parameter_ids
+            ]
+            self.world_model_optimizer = torch.optim.Adam(
+                [
+                    {"params": world_parameters, "lr": cfg.world_model_lr},
+                    {"params": q_parameters, "lr": cfg.critic_lr},
+                ]
+            )
+        else:
+            self.external_critic = ValueCritic(
+                self.model.latent_dim, cfg.mlp_dim, cfg.dropout
+            ).to(device)
+            self.augmented_critic = ValueCritic(
+                self.model.latent_dim, cfg.mlp_dim, cfg.dropout
+            ).to(device)
+            world_parameters = [
+                parameter
+                for parameter in self.model.parameters()
+                if parameter.requires_grad
+            ]
+            self.world_model_optimizer = torch.optim.Adam(
+                world_parameters, lr=cfg.world_model_lr
+            )
+            self.critic_optimizer = torch.optim.Adam(
+                [
+                    *self.external_critic.parameters(),
+                    *self.augmented_critic.parameters(),
+                ],
+                lr=cfg.critic_lr,
+                eps=1e-5,
+            )
+            self.external_critic.eval()
+            self.augmented_critic.eval()
         self.model.eval()
         self.actor.eval()
-        self.external_critic.eval()
-        self.augmented_critic.eval()
 
     def _observation_tensor(
         self, observation: Mapping[str, np.ndarray | torch.Tensor]
@@ -202,7 +258,9 @@ class M4POAgent(nn.Module):
     ) -> torch.Tensor:
         if value is None:
             return torch.zeros(batch_size, dtype=torch.long, device=self.device)
-        return torch.as_tensor(value, dtype=torch.long, device=self.device).reshape(batch_size)
+        return torch.as_tensor(value, dtype=torch.long, device=self.device).reshape(
+            batch_size
+        )
 
     def _mask_tensor(
         self,
@@ -274,6 +332,7 @@ class M4POAgent(nn.Module):
         *,
         task_ids: np.ndarray | torch.Tensor | None = None,
         embodiment_ids: np.ndarray | torch.Tensor | None = None,
+        action_mask: np.ndarray | torch.Tensor | None = None,
         augmented: bool = False,
     ) -> np.ndarray:
         observation_t = self._observation_tensor(observation)
@@ -283,6 +342,13 @@ class M4POAgent(nn.Module):
         embodiment_t = self._ids_tensor(embodiment_ids, batch_size)
         latent = self.model.encode(observation_t, task_t, embodiment_t)
         assert isinstance(latent, torch.Tensor)
+        if self.cfg.learning_mode == "off_policy":
+            mask = self._mask_tensor(action_mask, batch_size)
+            action = self.actor.mean_action(latent, mask)
+            value = self.model.q(
+                latent, action, mask, task_t, embodiment_t, return_type="avg"
+            )
+            return to_numpy(value.squeeze(-1)).astype(np.float32)
         critic = self.augmented_critic if augmented else self.external_critic
         return to_numpy(critic(latent).squeeze(-1)).astype(np.float32)
 
@@ -842,9 +908,214 @@ class M4POAgent(nn.Module):
             "model_grad_norm": torch.as_tensor(grad_norm, device=self.device).detach(),
         }
 
-    def update(self, rollout: RolloutBatch, *, progress_fraction: float) -> Dict[str, float]:
+    def _update_replay(
+        self, batch: ReplayBatch, *, actor_mode: str = "q_max"
+    ) -> Dict[str, float]:
+        """Fit the world model and Q targets, then optimize the selected actor loss."""
+
+        if actor_mode not in {"q_max", "behavior_cloning"}:
+            raise ValueError("actor_mode must be 'q_max' or 'behavior_cloning'")
+        cfg = self.cfg
+        batch = batch.to(self.device)
+        horizon = batch.actions.shape[0]
+        if horizon != cfg.model_horizon:
+            raise ValueError(
+                f"Replay horizon must equal model_horizon={cfg.model_horizon}"
+            )
+        weights = batch.valid * (
+            cfg.rho ** torch.arange(horizon, device=self.device)
+        ).view(-1, 1, 1)
+        if not bool((weights.sum() > 0).item()):
+            raise ValueError("Replay batch must contain at least one valid transition")
+
+        def weighted_mean(values: torch.Tensor) -> torch.Tensor:
+            return (values * weights).sum() / weights.sum()
+
+        self.model.eval()
+        self.actor.eval()
+        with torch.no_grad():
+            next_observations = {
+                name: value[1:] for name, value in batch.observations.items()
+            }
+            target_latents = self.model.target_encode(
+                next_observations, batch.task_ids[1:], batch.embodiment_ids[1:]
+            )
+            # Q and its target share the online latent coordinates, as in M3PO.
+            next_latents = self.model.encode(
+                next_observations, batch.task_ids[1:], batch.embodiment_ids[1:]
+            )
+            next_actions, _ = self.actor.sample_squashed(
+                next_latents, batch.action_masks
+            )
+            next_q = self.model.q(
+                next_latents,
+                next_actions,
+                batch.action_masks,
+                batch.task_ids[1:],
+                batch.embodiment_ids[1:],
+                target=True,
+                return_type="min",
+            )
+            td_targets = (
+                batch.rewards + cfg.discount * (1.0 - batch.terminated) * next_q
+            )
+
+        self.model.train()
+        latent = self.model.encode(
+            {name: value[0] for name, value in batch.observations.items()},
+            batch.task_ids[0],
+            batch.embodiment_ids[0],
+        )
+        actor_latents: list[torch.Tensor] = []
+        consistency_losses: list[torch.Tensor] = []
+        reward_losses: list[torch.Tensor] = []
+        q_losses: list[torch.Tensor] = []
+        termination_losses: list[torch.Tensor] = []
+        for index in range(horizon):
+            actor_latents.append(latent.detach())
+            action, mask = batch.actions[index], batch.action_masks[index]
+            task, embodiment = batch.task_ids[index], batch.embodiment_ids[index]
+            reward = self.model.reward(latent, action, mask, task, embodiment)
+            q_values = self.model.q(latent, action, mask, task, embodiment)
+            termination = self.model.termination_logits(
+                latent, action, mask, task, embodiment
+            )
+            latent = self.model.next(latent, action, mask, task, embodiment)
+            consistency_losses.append(
+                (latent - target_latents[index]).square().mean(dim=-1, keepdim=True)
+            )
+            reward_losses.append(
+                F.smooth_l1_loss(reward, batch.rewards[index], reduction="none")
+            )
+            q_losses.append(
+                F.smooth_l1_loss(
+                    q_values,
+                    td_targets[index].unsqueeze(0).expand_as(q_values),
+                    reduction="none",
+                ).mean(dim=0)
+            )
+            termination_losses.append(
+                F.binary_cross_entropy_with_logits(
+                    termination, batch.terminated[index], reduction="none"
+                )
+            )
+        consistency_loss = weighted_mean(torch.stack(consistency_losses))
+        reward_loss = weighted_mean(torch.stack(reward_losses))
+        q_loss = weighted_mean(torch.stack(q_losses))
+        termination_loss = weighted_mean(torch.stack(termination_losses))
+        model_loss = (
+            cfg.consistency_coef * consistency_loss
+            + cfg.reward_coef * reward_loss
+            + cfg.value_coef * q_loss
+            + cfg.termination_coef * termination_loss
+        )
+        self.world_model_optimizer.zero_grad(set_to_none=True)
+        model_loss.backward()
+        model_grad_norm = torch.nn.utils.clip_grad_norm_(
+            [
+                parameter
+                for parameter in self.model.parameters()
+                if parameter.requires_grad
+            ],
+            cfg.grad_clip_norm,
+        )
+        self.world_model_optimizer.step()
+        self.world_model_optimizer.zero_grad(set_to_none=True)
+        self.model.eval()
+
+        latents = torch.stack(actor_latents).detach()
+        self.actor.train()
+        # Both objectives isolate the actor from the world model. Q maximization
+        # retains dQ/da; demonstration cloning requires no actor-stage Q call.
+        with self.model.frozen_parameters():
+            actions, info = self.actor.sample_squashed(latents, batch.action_masks)
+            policy_q = None
+            bc_loss = actions.new_zeros(())
+            if actor_mode == "behavior_cloning":
+                difference = torch.where(
+                    batch.action_masks.bool(),
+                    actions - batch.actions,
+                    torch.zeros_like(actions),
+                )
+                valid_dimensions = batch.action_masks.sum(
+                    dim=-1, keepdim=True
+                ).clamp_min(1.0)
+                bc_loss = weighted_mean(
+                    difference.square().sum(dim=-1, keepdim=True) / valid_dimensions
+                )
+                actor_loss = bc_loss - cfg.entropy_coef * weighted_mean(
+                    info["scaled_entropy"]
+                )
+            else:
+                policy_q = self.model.q(
+                    latents,
+                    actions,
+                    batch.action_masks,
+                    batch.task_ids[:-1],
+                    batch.embodiment_ids[:-1],
+                    return_type="avg",
+                )
+                self.scale.update(policy_q[batch.valid.bool()])
+                actor_loss = -weighted_mean(
+                    self.scale(policy_q) + cfg.entropy_coef * info["scaled_entropy"]
+                )
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            actor_loss.backward()
+            actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.actor.parameters(), cfg.grad_clip_norm
+            )
+            self.actor_optimizer.step()
+            self.actor_optimizer.zero_grad(set_to_none=True)
+        self.actor.eval()
+        self.model.soft_update_targets()
+        metrics = {
+            "model_loss": model_loss,
+            "consistency_loss": consistency_loss,
+            "reward_loss": reward_loss,
+            "q_loss": q_loss,
+            "termination_loss": termination_loss,
+            "model_grad_norm": torch.as_tensor(model_grad_norm),
+            "actor_loss": actor_loss,
+            "bc_loss": bc_loss,
+            "actor_grad_norm": torch.as_tensor(actor_grad_norm),
+            "policy_entropy": weighted_mean(info["entropy"]),
+            **({"policy_q": weighted_mean(policy_q)} if policy_q is not None else {}),
+            "policy_scale": self.scale.value,
+            "td_target_mean": weighted_mean(td_targets),
+            "replay_valid_fraction": batch.valid.mean(),
+        }
+        return {
+            **{
+                name: float(value.detach().mean().item())
+                for name, value in metrics.items()
+            },
+            "actor_learning_rate": float(self.actor_optimizer.param_groups[0]["lr"]),
+            "actor_optimizer_steps": 1.0,
+            "actor_bc_enabled": float(actor_mode == "behavior_cloning"),
+            "exploration_effective_weight": 0.0,
+            "exploration_bonus_abs_mean": 0.0,
+            "policy_optimization_effective_weight": 0.0,
+        }
+
+    def update(
+        self,
+        rollout: RolloutBatch | EpisodeReplayBuffer,
+        *,
+        progress_fraction: float = 0.0,
+        actor_mode: str = "q_max",
+    ) -> Dict[str, float]:
+        if actor_mode not in {"q_max", "behavior_cloning"}:
+            raise ValueError("actor_mode must be 'q_max' or 'behavior_cloning'")
+        if actor_mode == "behavior_cloning" and self.cfg.learning_mode != "off_policy":
+            raise ValueError("Behavior cloning requires off-policy replay learning")
         if not 0.0 <= progress_fraction <= 1.0:
             raise ValueError("progress_fraction must be in [0, 1]")
+        if self.cfg.learning_mode == "off_policy":
+            if not isinstance(rollout, EpisodeReplayBuffer):
+                raise TypeError("Off-policy updates require an EpisodeReplayBuffer")
+            return self._update_replay(rollout.sample(), actor_mode=actor_mode)
+        if not isinstance(rollout, RolloutBatch):
+            raise TypeError("On-policy updates require a fresh RolloutBatch")
         if not rollout.is_time_major:
             raise ValueError("M4PO updates require a time-major fresh rollout")
         if rollout.length != self.cfg.rollout_steps:
@@ -880,15 +1151,27 @@ class M4POAgent(nn.Module):
         }
         return {name: float(value.detach().mean().item()) for name, value in combined.items()}
 
-    def save(self, path: str | Path, step: int, extra: dict[str, Any] | None = None) -> None:
+    def save(
+        self, path: str | Path, step: int, extra: dict[str, Any] | None = None
+    ) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         task_contexts = self.model.encoder.task_context_features
+        learner_state = (
+            {"scale": self.scale.state_dict()}
+            if self.cfg.learning_mode == "off_policy"
+            else {
+                "external_critic": self.external_critic.state_dict(),
+                "augmented_critic": self.augmented_critic.state_dict(),
+                "critic_optimizer": self.critic_optimizer.state_dict(),
+            }
+        )
         torch.save(
             {
                 "algorithm": "m4po",
                 "implementation_id": IMPLEMENTATION_ID,
                 "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+                "learning_mode": self.cfg.learning_mode,
                 "step": int(step),
                 "observation_spec": {
                     "image_shape": self.observation_spec.image_shape,
@@ -897,45 +1180,73 @@ class M4POAgent(nn.Module):
                 },
                 "action_dim": self.action_dim,
                 "cfg": self.cfg.to_dict(),
-                "task_contexts": None if task_contexts is None else task_contexts.detach().cpu(),
+                "task_contexts": None
+                if task_contexts is None
+                else task_contexts.detach().cpu(),
                 "model": self.model.state_dict(),
                 "actor": self.actor.state_dict(),
-                "external_critic": self.external_critic.state_dict(),
-                "augmented_critic": self.augmented_critic.state_dict(),
                 "world_model_optimizer": self.world_model_optimizer.state_dict(),
                 "actor_optimizer": self.actor_optimizer.state_dict(),
-                "critic_optimizer": self.critic_optimizer.state_dict(),
+                **learner_state,
                 "extra": extra or {},
             },
             path,
         )
 
-    def load_checkpoint(self, path: str | Path, *, restore_optimizers: bool = False) -> dict[str, Any]:
-        payload = torch.load(Path(path), map_location=self.device, weights_only=False)
+    def load_checkpoint(
+        self, path: str | Path, *, restore_optimizers: bool = False
+    ) -> dict[str, Any]:
+        payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+        return self._load_payload(payload, restore_optimizers=restore_optimizers)
+
+    def _load_payload(
+        self, payload: dict[str, Any], *, restore_optimizers: bool = False
+    ) -> dict[str, Any]:
         if payload.get("algorithm") != "m4po":
-            raise ValueError(f"Expected algorithm='m4po', got {payload.get('algorithm')!r}")
+            raise ValueError(
+                f"Expected algorithm='m4po', got {payload.get('algorithm')!r}"
+            )
         if payload.get("implementation_id") != IMPLEMENTATION_ID:
             raise ValueError(
                 f"Expected implementation_id={IMPLEMENTATION_ID!r}, "
                 f"got {payload.get('implementation_id')!r}"
             )
-        if payload.get("checkpoint_schema_version") != CHECKPOINT_SCHEMA_VERSION:
+        if payload.get("checkpoint_schema_version") not in {
+            2,
+            CHECKPOINT_SCHEMA_VERSION,
+        }:
             raise ValueError(
                 f"Expected checkpoint_schema_version={CHECKPOINT_SCHEMA_VERSION}, "
                 f"got {payload.get('checkpoint_schema_version')!r}"
             )
+        saved_mode = M4POConfig.from_checkpoint_dict(payload["cfg"]).learning_mode
+        if saved_mode != self.cfg.learning_mode:
+            raise ValueError(
+                f"Checkpoint learning_mode={saved_mode!r} cannot load into "
+                f"learning_mode={self.cfg.learning_mode!r}; start a fresh run"
+            )
+        if payload.get("learning_mode", saved_mode) != saved_mode:
+            raise ValueError(
+                "Checkpoint learning_mode metadata disagrees with its configuration"
+            )
+        if payload.get("checkpoint_schema_version") == 2 and saved_mode != "on_policy":
+            raise ValueError("Schema-2 checkpoints only support on_policy learning")
         self.model.load_state_dict(payload["model"])
         self.actor.load_state_dict(payload["actor"])
-        self.external_critic.load_state_dict(payload["external_critic"])
-        self.augmented_critic.load_state_dict(payload["augmented_critic"])
+        if saved_mode == "off_policy":
+            self.scale.load_state_dict(payload["scale"])
+        else:
+            self.external_critic.load_state_dict(payload["external_critic"])
+            self.augmented_critic.load_state_dict(payload["augmented_critic"])
+            self.external_critic.eval()
+            self.augmented_critic.eval()
         if restore_optimizers:
             self.world_model_optimizer.load_state_dict(payload["world_model_optimizer"])
             self.actor_optimizer.load_state_dict(payload["actor_optimizer"])
-            self.critic_optimizer.load_state_dict(payload["critic_optimizer"])
+            if saved_mode == "on_policy":
+                self.critic_optimizer.load_state_dict(payload["critic_optimizer"])
         self.model.eval()
         self.actor.eval()
-        self.external_critic.eval()
-        self.augmented_critic.eval()
         return payload
 
     @classmethod
@@ -946,15 +1257,23 @@ class M4POAgent(nn.Module):
         override_cfg: M4POConfig | None = None,
         *,
         restore_optimizers: bool = False,
+        _payload: dict[str, Any] | None = None,
     ) -> M4POAgent:
-        payload = torch.load(Path(path), map_location=device, weights_only=False)
-        if (
-            payload.get("implementation_id") != IMPLEMENTATION_ID
-            or payload.get("checkpoint_schema_version") != CHECKPOINT_SCHEMA_VERSION
-        ):
+        # Replay snapshots can occupy many GB. Keep them on the CPU and allow
+        # the trainer/evaluator to reuse its already-validated deserialization.
+        payload = _payload if _payload is not None else torch.load(
+            Path(path), map_location="cpu", weights_only=False
+        )
+        if payload.get("implementation_id") != IMPLEMENTATION_ID or payload.get(
+            "checkpoint_schema_version"
+        ) not in {2, CHECKPOINT_SCHEMA_VERSION}:
             raise ValueError("Checkpoint is incompatible with this M4PO implementation")
-        cfg = M4POConfig(**payload["cfg"])
+        cfg = M4POConfig.from_checkpoint_dict(payload["cfg"])
         if override_cfg is not None:
+            if override_cfg.learning_mode != cfg.learning_mode:
+                raise ValueError(
+                    "Checkpoint learning_mode cannot be changed when loading; start a fresh run"
+                )
             values = cfg.to_dict()
             overrides = override_cfg.to_dict()
             runtime_keys = {
@@ -971,6 +1290,10 @@ class M4POAgent(nn.Module):
                 "torch_deterministic",
                 "quiet",
                 "resume_checkpoint",
+                "save_replay",
+                "max_wall_time_seconds",
+                "mmbench_root",
+                "mmbench_eval_num_envs",
             }
             for key in runtime_keys:
                 values[key] = overrides[key]
@@ -985,5 +1308,5 @@ class M4POAgent(nn.Module):
             device,
             task_contexts=payload.get("task_contexts"),
         )
-        agent.load_checkpoint(path, restore_optimizers=restore_optimizers)
+        agent._load_payload(payload, restore_optimizers=restore_optimizers)
         return agent
