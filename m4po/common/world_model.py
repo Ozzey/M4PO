@@ -352,6 +352,7 @@ class HierarchicalWorldModel(nn.Module):
         self.model_latent_dim = self.task_latent_dim + self.body_latent_dim
         self.task_context_dim = int(cfg.task_context_dim)
         self.embodiment_context_dim = int(cfg.embodiment_context_dim)
+        self.off_policy = getattr(cfg, "learning_mode", "off_policy") == "off_policy"
 
         self.encoder = _HierarchicalEncoder(observation_spec, cfg, task_contexts)
         body_dynamics_input = (
@@ -404,11 +405,26 @@ class HierarchicalWorldModel(nn.Module):
             1,
             dropout=cfg.dropout,
         )
+        if self.off_policy:
+            # Include the mask itself so a valid zero action is distinguishable
+            # from a padded coordinate shared across different embodiments.
+            self.q_functions = nn.ModuleList(
+                mlp(
+                    state_action_head_input + self.action_dim,
+                    [cfg.mlp_dim, cfg.mlp_dim],
+                    1,
+                    dropout=cfg.dropout,
+                )
+                for _ in range(int(cfg.num_q))
+            )
 
         self.apply(weight_init)
         nn.init.zeros_(self.reward_head[-1].weight)
         nn.init.zeros_(self.value_head[-1].weight)
         nn.init.zeros_(self.termination_head[-1].weight)
+        if self.off_policy:
+            for q_function in self.q_functions:
+                nn.init.zeros_(q_function[-1].weight)
 
         self.target_encoder = deepcopy(self.encoder)
         self.target_value_head = deepcopy(self.value_head)
@@ -416,6 +432,10 @@ class HierarchicalWorldModel(nn.Module):
         self.target_value_head.requires_grad_(False)
         self.target_encoder.eval()
         self.target_value_head.eval()
+        if self.off_policy:
+            self.target_q_functions = deepcopy(self.q_functions)
+            self.target_q_functions.requires_grad_(False)
+            self.target_q_functions.eval()
 
     @property
     def latent_dim(self) -> int:
@@ -453,6 +473,8 @@ class HierarchicalWorldModel(nn.Module):
         super().train(mode)
         self.target_encoder.eval()
         self.target_value_head.eval()
+        if self.off_policy:
+            self.target_q_functions.eval()
         return self
 
     def encode(
@@ -549,7 +571,8 @@ class HierarchicalWorldModel(nn.Module):
                         f"{tuple(action_mask.shape)}"
                     ) from exc
             action_mask = action_mask.to(device=action.device, dtype=action.dtype)
-        return action * action_mask, action_mask
+        safe_action = torch.where(action_mask.bool(), action, torch.zeros_like(action))
+        return safe_action * action_mask, action_mask
 
     def next(
         self,
@@ -649,6 +672,51 @@ class HierarchicalWorldModel(nn.Module):
         )
         value_head = self.target_value_head if target else self.value_head
         return value_head(torch.cat((latent, task_context, embodiment_context), dim=-1))
+
+    def q(
+        self,
+        latent: torch.Tensor,
+        action: torch.Tensor,
+        action_mask: torch.Tensor | None = None,
+        task_ids: torch.Tensor | Any | None = None,
+        embodiment_ids: torch.Tensor | Any | None = None,
+        *,
+        target: bool = False,
+        return_type: str = "all",
+    ) -> torch.Tensor:
+        """Evaluate the off-policy Q ensemble on masked shared actions.
+
+        ``all`` returns ``[num_q, *batch_shape, 1]``; ``avg`` averages all heads,
+        and ``min`` takes the minimum of two uniformly sampled distinct heads.
+        Target heads consume online-encoded latents and detached online contexts,
+        as in M3PO; the separate EMA encoder is for consistency supervision.
+        """
+
+        if not self.off_policy:
+            raise RuntimeError("Action-value heads require learning_mode='off_policy'")
+        if return_type not in {"all", "avg", "min"}:
+            raise ValueError("Q return_type must be 'all', 'avg', or 'min'")
+        if latent.shape[-1] != self.model_latent_dim:
+            raise ValueError(
+                f"Expected latent dimension {self.model_latent_dim}, got {latent.shape[-1]}"
+            )
+        action, action_mask = self._masked_action(action, action_mask)
+        task_context, embodiment_context = self._contexts(
+            latent, task_ids, embodiment_ids, None, None
+        )
+        if target:
+            task_context = task_context.detach()
+            embodiment_context = embodiment_context.detach()
+        inputs = torch.cat(
+            (latent, action, action_mask, task_context, embodiment_context), dim=-1
+        )
+        q_functions = self.target_q_functions if target else self.q_functions
+        if return_type == "min":
+            indices = torch.randperm(len(q_functions), device=latent.device)[:2]
+            values = torch.stack([q_functions[int(index)](inputs) for index in indices])
+            return values.amin(dim=0)
+        values = torch.stack([q_function(inputs) for q_function in q_functions])
+        return values.mean(dim=0) if return_type == "avg" else values
 
     def target_value(
         self,
@@ -758,6 +826,8 @@ class HierarchicalWorldModel(nn.Module):
     def hard_update_targets(self) -> None:
         self.target_encoder.load_state_dict(self.encoder.state_dict())
         self.target_value_head.load_state_dict(self.value_head.state_dict())
+        if self.off_policy:
+            self.target_q_functions.load_state_dict(self.q_functions.state_dict())
 
     @torch.no_grad()
     def soft_update_targets(self, decay: float | None = None) -> None:
@@ -776,6 +846,13 @@ class HierarchicalWorldModel(nn.Module):
             strict=True,
         ):
             target.mul_(decay).add_(online, alpha=1.0 - decay)
+        if self.off_policy:
+            for online, target in zip(
+                self.q_functions.parameters(),
+                self.target_q_functions.parameters(),
+                strict=True,
+            ):
+                target.mul_(decay).add_(online, alpha=1.0 - decay)
         for online, target in zip(
             self.encoder.buffers(),
             self.target_encoder.buffers(),

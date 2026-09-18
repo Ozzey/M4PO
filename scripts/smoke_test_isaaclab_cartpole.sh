@@ -52,9 +52,13 @@ records = [
     for line in (run_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
     if line.strip()
 ]
-training = [record for record in records if record.get("phase") == "on_policy_training"]
+training = [record for record in records if record.get("phase") == "off_policy_training"]
 if not training or int(training[-1].get("episodes_completed", 0)) < 64:
     raise SystemExit("Cartpole smoke did not complete at least one episode per environment and rollout")
+if not any(int(record.get("updates", 0)) > 0 for record in training):
+    raise SystemExit("Cartpole smoke did not execute off-policy replay updates")
+if not any(int(record.get("replay_transitions", 0)) > 0 for record in training):
+    raise SystemExit("Cartpole smoke did not retain completed episodes in replay")
 
 benchmark = json.loads((run_dir / "benchmark.json").read_text(encoding="utf-8"))
 expected_tasks = {"Isaac-Cartpole-Direct-v0", "Isaac-Cartpole-v0"}

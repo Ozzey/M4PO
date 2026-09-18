@@ -20,7 +20,11 @@ def add_config_args(parser: argparse.ArgumentParser) -> None:
         name = field.name
         default = getattr(defaults, name)
         flag = "--" + name.replace("_", "-")
-        kwargs = {"dest": name, "default": None, "help": f"Override config field `{name}`."}
+        kwargs = {
+            "dest": name,
+            "default": None,
+            "help": f"Override config field `{name}`.",
+        }
         if isinstance(default, bool):
             parser.add_argument(flag, action=argparse.BooleanOptionalAction, **kwargs)
         elif default is None:
@@ -34,8 +38,12 @@ def add_config_args(parser: argparse.ArgumentParser) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train M4PO on fresh parallel rollouts.")
-    parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG), help="YAML config file.")
+    parser = argparse.ArgumentParser(
+        description="Train M4PO with episodic off-policy replay (or legacy PPO)."
+    )
+    parser.add_argument(
+        "--config", type=str, default=str(DEFAULT_CONFIG), help="YAML config file."
+    )
     add_config_args(parser)
     return parser.parse_args()
 
@@ -54,4 +62,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

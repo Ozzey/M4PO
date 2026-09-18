@@ -19,6 +19,7 @@ from m4po.m4po import M4POAgent, _policy_ratio_statistics
 
 def small_cfg(tmp_path: Path, *, images: bool = False) -> M4POConfig:
     return M4POConfig(
+        learning_mode="on_policy",
         env="mock",
         task="reach",
         tasks="reach,push",

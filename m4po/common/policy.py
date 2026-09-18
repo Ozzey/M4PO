@@ -4,6 +4,7 @@ import math
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from .config import M4POConfig
 from .layers import mlp, weight_init
@@ -97,7 +98,10 @@ class GaussianActor(nn.Module):
                 )
             noise = noise.to(device=mean.device, dtype=mean.dtype)
         mask = self._action_mask(action_mask, mean)
-        pre_tanh = (mean + std * noise) * mask
+        safe_noise = torch.where(mask.bool(), noise, torch.zeros_like(noise))
+        pre_tanh = torch.where(
+            mask.bool(), mean + std * safe_noise, torch.zeros_like(mean)
+        ) * mask
         return pre_tanh, {
             "mean": mean * mask,
             "std": std,
@@ -153,4 +157,64 @@ class GaussianActor(nn.Module):
             "log_prob": log_prob,
             "entropy": -log_prob,
             "scaled_entropy": -log_prob / valid_dimensions,
+        }
+
+    def squashed_log_prob(
+        self,
+        latent: torch.Tensor,
+        action: torch.Tensor,
+        action_mask: torch.Tensor | None = None,
+        *,
+        pre_tanh: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Density in action space, including the stable tanh Jacobian.
+
+        Pass ``pre_tanh`` for samples produced by this actor so saturated actions
+        retain their exact finite density without an inverse-tanh round trip.
+        The legacy ``log_prob`` method deliberately remains a pre-tanh density.
+        """
+
+        mask = self._action_mask(action_mask, action)
+        if pre_tanh is None:
+            safe_action = torch.where(mask.bool(), action, torch.zeros_like(action))
+            epsilon = torch.finfo(action.dtype).eps
+            pre_tanh = torch.atanh(safe_action.clamp(-1.0 + epsilon, 1.0 - epsilon))
+        elif pre_tanh.shape != action.shape:
+            raise ValueError("Pre-tanh action must have the same shape as the action")
+        safe_pre_tanh = torch.where(
+            mask.bool(), pre_tanh, torch.zeros_like(pre_tanh)
+        )
+        log_jacobian = 2.0 * (
+            math.log(2.0) - safe_pre_tanh - F.softplus(-2.0 * safe_pre_tanh)
+        )
+        return self.log_prob(latent, safe_pre_tanh, mask) - (
+            log_jacobian * mask
+        ).sum(dim=-1, keepdim=True)
+
+    def sample_squashed(
+        self,
+        latent: torch.Tensor,
+        action_mask: torch.Tensor | None = None,
+        *,
+        noise: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Reparameterized action and entropy for replay-based Q maximization.
+
+        M3PO scales sampled entropy by the number of valid action coordinates;
+        padded coordinates contribute neither density nor dimension count.
+        """
+
+        pre_tanh, info = self.sample_pre_tanh(latent, action_mask, noise=noise)
+        mask = self._action_mask(action_mask, pre_tanh)
+        action = torch.tanh(pre_tanh) * mask
+        log_prob = self.squashed_log_prob(
+            latent, action, mask, pre_tanh=pre_tanh
+        )
+        valid_dimensions = mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        return action, {
+            **info,
+            "pre_tanh": pre_tanh,
+            "log_prob": log_prob,
+            "entropy": -log_prob,
+            "scaled_entropy": -log_prob * valid_dimensions,
         }

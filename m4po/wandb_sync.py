@@ -166,6 +166,16 @@ def record_to_wandb(record: Mapping[str, Any]) -> dict[str, Any]:
     if _is_numeric(source_time):
         output["source/wall_time"] = source_time
 
+    if record.get("phase") == "demonstration_pretraining":
+        updates = record.get("pretrain_updates")
+        if _is_numeric(updates):
+            output["pretrain_update"] = int(updates)
+        _flatten_scalars(
+            {key: value for key, value in record.items() if key not in {"step", "time"}},
+            prefix="pretrain", output=output, numeric_only=False,
+        )
+        return output
+
     if isinstance(record.get("eval"), Mapping):
         _flatten_scalars(
             record["eval"],
@@ -192,6 +202,33 @@ def record_to_wandb(record: Mapping[str, Any]) -> dict[str, Any]:
     ):
         # Keep the source-compatible name while exposing a concise W&B series.
         output["train/success_rate_20"] = success_rate
+    score_mean = training.get("train_score_mean_20")
+    if _is_numeric(score_mean) and math.isfinite(score_mean):
+        output["train/score_mean_20"] = score_mean
+    rolling_aliases = {
+        "train_success_rate_supported_tasks_20": "train/rolling_success_rate",
+        "train_success_task_coverage": "train/rolling_success_task_coverage",
+        "train_success_tasks": "train/rolling_success_task_count",
+        "train_success_episodes_in_window": "train/rolling_success_episode_count",
+        "train_score_macro_20": "train/rolling_normalized_score",
+        "train_score_task_coverage": "train/rolling_score_task_coverage",
+    }
+    for source, destination in rolling_aliases.items():
+        value = training.get(source)
+        if _is_numeric(value) and math.isfinite(value):
+            output[destination] = value
+    per_task = training.get("train_per_task")
+    if isinstance(per_task, Mapping):
+        for task, metrics in per_task.items():
+            if not isinstance(metrics, Mapping):
+                continue
+            for source, name in (
+                ("success_rate_20", "rolling_success_rate"),
+                ("score_mean_20", "rolling_normalized_score"),
+            ):
+                value = metrics.get(source)
+                if _is_numeric(value) and math.isfinite(value):
+                    output[f"train/task/{task}/{name}"] = value
     return output
 
 
@@ -354,9 +391,29 @@ def _last_environment_step(path: Path) -> int | None:
     return latest
 
 
+def _last_pretrain_update(path: Path) -> int | None:
+    latest = None
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, Mapping) and row.get("phase") == "demonstration_pretraining":
+                value = row.get("pretrain_updates")
+                if type(value) is int and value >= 0:
+                    latest = value
+    return latest
+
+
 def _final_environment_step(
     config: Mapping[str, Any], metrics_path: Path
 ) -> int | None:
+    # Actual progress wins over the intended budget (offline updates stay at 0).
+    if metrics_path.exists():
+        actual = _last_environment_step(metrics_path)
+        if actual is not None:
+            return actual
     configured = config.get("total_steps")
     if _is_numeric(configured) and (
         not isinstance(configured, float) or math.isfinite(configured)
@@ -379,16 +436,20 @@ def _log_benchmark(
 
     if environment_step is None:
         return cursor
-    success_metrics = {
+    benchmark_metrics = {
         key: value
         for key, value in summary.items()
         if key == "eval/success_rate"
         or key == "eval/worst_embodiment_success"
         or (key.startswith("eval/per_task/") and key.endswith("/success_rate"))
+        or key == "eval/score_mean"
+        or key == "eval/worst_embodiment_score"
+        or (key.startswith("eval/per_task/") and key.endswith("/score_mean"))
+        or key.startswith("eval/action_timing/")
     }
-    if success_metrics:
+    if benchmark_metrics:
         run.log(
-            {"environment_step": environment_step, **success_metrics},
+            {"environment_step": environment_step, **benchmark_metrics},
             step=cursor.next_history_step,
             commit=True,
         )
@@ -487,8 +548,19 @@ def main(argv: list[str] | None = None) -> None:
     if run is None or not run.url:
         raise RuntimeError("W&B did not return an online run URL")
     run.define_metric("environment_step")
+    run.define_metric("pretrain_update")
+    run.define_metric("pretrain/*", step_metric="pretrain_update")
     run.define_metric("train/*", step_metric="environment_step")
     run.define_metric("eval/*", step_metric="environment_step")
+    run.summary["metrics/rolling_success_definition"] = (
+        "Task-macro native success over each contributing task's last 20 completed "
+        "episodes; tasks without native success are excluded, never treated as failures. "
+        "See rolling_success_task_coverage; this is not all-200 MMBench success."
+    )
+    run.summary["metrics/rolling_score_definition"] = (
+        "Task-macro native normalized score over each task's last 20 completed "
+        "episodes; see rolling_score_task_coverage."
+    )
     _atomic_text(args.url_file, f"{run.url}\n")
     print(f"WANDB_RUN_URL={run.url}", flush=True)
 
@@ -509,6 +581,11 @@ def main(argv: list[str] | None = None) -> None:
             evaluation_state = query_slurm_state(args.evaluation_job_id)
             run.summary["slurm/training_state"] = training_state
             run.summary["slurm/evaluation_state"] = evaluation_state
+            run.summary["pipeline/status"] = (
+                "job_completed" if training_state == "COMPLETED"
+                else "job_failed" if training_state in TERMINAL_SLURM_STATES
+                else "running"
+            )
             run.summary["sync/source_records"] = cursor.next_line_index
 
             training_terminal = training_state in TERMINAL_SLURM_STATES
@@ -553,7 +630,10 @@ def main(argv: list[str] | None = None) -> None:
             artifact = wandb.Artifact(
                 f"{args.run_id}-checkpoint",
                 type="model",
-                metadata={"environment_step": resolved_config.get("total_steps")},
+                metadata={
+                    "environment_step": _final_environment_step(resolved_config, args.metrics),
+                    "pretrain_updates": _last_pretrain_update(args.metrics),
+                },
             )
             artifact.add_file(str(args.checkpoint), name="latest.pt")
             run.log_artifact(artifact, aliases=["latest", "final"])

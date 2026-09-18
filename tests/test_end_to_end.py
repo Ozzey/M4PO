@@ -28,6 +28,7 @@ def _optimizer_step(payload: dict, name: str) -> int:
 
 def test_mock_train_and_evaluate_pipeline(tmp_path: Path):
     cfg = M4POConfig.from_yaml("m4po/configs/mock_smoke.yaml")
+    cfg.learning_mode = "on_policy"
     cfg.total_steps = cfg.num_envs * cfg.rollout_steps
     cfg.save_every = 0
     cfg.log_every = cfg.total_steps
@@ -78,6 +79,7 @@ def test_mock_train_and_evaluate_pipeline(tmp_path: Path):
 
 def test_resume_restores_optimizers_and_exact_progress(tmp_path: Path):
     cfg = M4POConfig.from_yaml("m4po/configs/mock_smoke.yaml")
+    cfg.learning_mode = "on_policy"
     cfg.total_steps = cfg.rollout_batch_size
     cfg.eval_every = 0
     cfg.save_every = 0

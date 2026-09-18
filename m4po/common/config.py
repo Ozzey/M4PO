@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
 
 IMPLEMENTATION_ID = "m4po_multitask_multiembodiment"
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
 
 
 def _split_names(value: Optional[str]) -> List[str]:
@@ -18,7 +19,7 @@ def _split_names(value: Optional[str]) -> List[str]:
 
 @dataclass
 class M4POConfig:
-    """Flat configuration for collection, world modeling, planning, and PPO."""
+    """Flat configuration for replay learning, world modeling, and planning."""
 
     # Environment and multimodal observations.
     env: str = "mock"
@@ -48,14 +49,28 @@ class M4POConfig:
     isaaclab_headless: bool = True
     isaaclab_enable_cameras: bool = False
     isaaclab_use_fabric: bool = True
+    mmbench_root: Optional[str] = None
+    mmbench_task_set: str = "soup"
+    mmbench_eval_num_envs: int = 1
+    mmbench_sampling: str = "episodes"
 
-    # Fresh on-policy collection and optimization.
+    # Episodic off-policy learning; PPO remains an explicit legacy mode.
+    learning_mode: str = "off_policy"
+    seed_steps: int = 1_000
+    pretrain_updates: int = 1_000
+    updates_per_step: float = 1.0
+    replay_capacity: int = 1_000_000
+    batch_size: int = 256
+    num_q: int = 5
+    rho: float = 0.5
     total_steps: int = 1_048_576
     rollout_steps: int = 128
     updates_per_rollout: int = 4
     ppo_epochs: int = 4
     minibatch_size: int = 256
     eval_every: int = 131_072
+    eval_at_start: bool = False
+    eval_episodes: int = 3
     save_every: int = 131_072
     log_every: int = 16_384
     log_dir: str = "runs/m4po"
@@ -90,7 +105,7 @@ class M4POConfig:
     ppo_target_kl: Optional[float] = None
     value_clip_ratio: Optional[float] = None
     critic_coef: float = 1.0
-    entropy_coef: float = 0.0
+    entropy_coef: float = 1e-4
 
     # Stochastic MPPI distribution.
     planner_samples: int = 64
@@ -99,8 +114,13 @@ class M4POConfig:
     log_std_min: float = -5.0
     log_std_max: float = 2.0
 
-    # Model/model-free value-discrepancy bonus.
-    discrepancy_beta: float = 0.1
+    # No fresh-transition auxiliary or intrinsic reward in off-policy mode.
+    policy_optimization_enabled: bool = False
+    policy_optimization_weight: float = 0.0
+    exploration_bonus_enabled: bool = False
+    exploration_bonus_weight: float = 0.0
+    # Legacy on-policy model/model-free value-discrepancy bonus.
+    discrepancy_beta: float = 0.0
     discrepancy_max: float = 2.0
     discrepancy_decay_fraction: float = 1.0
     normalization_epsilon: float = 1e-6
@@ -108,8 +128,12 @@ class M4POConfig:
     # Runtime and checkpointing.
     device: str = "auto"
     torch_deterministic: bool = False
+    matmul_precision: str = "highest"
     quiet: bool = False
     resume_checkpoint: Optional[str] = None
+    init_checkpoint: Optional[str] = None
+    save_replay: bool = False
+    max_wall_time_seconds: int = 0
 
     @property
     def rollout_batch_size(self) -> int:
@@ -187,7 +211,52 @@ class M4POConfig:
         return (self.image_channels, self.image_size, self.image_size)
 
     def validate(self) -> None:
+        if self.matmul_precision not in {"highest", "high", "medium"}:
+            raise ValueError("matmul_precision must be highest, high, or medium")
+        if self.max_wall_time_seconds < 0:
+            raise ValueError("max_wall_time_seconds must be non-negative")
+        if self.env.lower().strip() == "mmbench":
+            from m4po.envs.mmbench_env import configure_mmbench
+
+            configure_mmbench(self)
+            if self.mmbench_eval_num_envs <= 0:
+                raise ValueError("mmbench_eval_num_envs must be positive")
+        if self.learning_mode not in {"off_policy", "on_policy"}:
+            raise ValueError("learning_mode must be one of: off_policy, on_policy")
+        if self.init_checkpoint and (
+            self.learning_mode != "off_policy" or self.env != "mmbench"
+        ):
+            raise ValueError("Demonstration initialization requires off-policy MMBench")
+        for name in ("seed_steps", "pretrain_updates"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        for name in ("replay_capacity", "batch_size", "num_q"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.num_q < 2:
+            raise ValueError("num_q must be at least two")
+        if not math.isfinite(self.updates_per_step) or self.updates_per_step <= 0:
+            raise ValueError("updates_per_step must be finite and positive")
+        if not 0.0 < self.rho <= 1.0:
+            raise ValueError("rho must be in (0, 1]")
+        if (
+            self.policy_optimization_enabled
+            or self.policy_optimization_weight != 0.0
+            or self.exploration_bonus_enabled
+            or self.exploration_bonus_weight != 0.0
+        ):
+            raise ValueError(
+                "Fresh-transition policy auxiliaries and exploration bonuses are not "
+                "implemented in the replay path; leave their flags false and weights zero"
+            )
+        if self.learning_mode == "off_policy" and self.discrepancy_beta != 0.0:
+            raise ValueError(
+                "Off-policy learning requires discrepancy_beta=0 (extrinsic rewards only)"
+            )
         positive = {
+            "eval_episodes": self.eval_episodes,
             "num_envs": self.num_envs,
             "max_episode_steps": self.max_episode_steps,
             "control_decimation": self.control_decimation,
@@ -287,23 +356,38 @@ class M4POConfig:
             raise ValueError("isaaclab_factory must be non-empty when configured")
         if not self.isaaclab_device.strip():
             raise ValueError("isaaclab_device must be non-empty")
-        if self.env.lower().strip() in {"isaaclab", "isaac_lab"} and not self.isaaclab_factory:
-            raise ValueError(
-                "env='isaaclab' requires an isaaclab_factory import path"
-            )
+        if (
+            self.env.lower().strip() in {"isaaclab", "isaac_lab"}
+            and not self.isaaclab_factory
+        ):
+            raise ValueError("env='isaaclab' requires an isaaclab_factory import path")
 
-        if self.total_steps % self.rollout_batch_size:
+        if self.learning_mode == "off_policy" and self.total_steps % self.num_envs:
+            raise ValueError("Off-policy total_steps must be divisible by num_envs")
+        if (
+            self.learning_mode == "on_policy"
+            and self.total_steps % self.rollout_batch_size
+        ):
             raise ValueError(
                 "total_steps must be divisible by num_envs * rollout_steps so every "
                 "update uses one complete fresh rollout"
             )
-        if self.model_horizon > self.rollout_steps:
+        if (
+            self.learning_mode == "on_policy"
+            and self.model_horizon > self.rollout_steps
+        ):
             raise ValueError("model_horizon cannot exceed rollout_steps")
-        if self.minibatch_size > self.rollout_batch_size:
+        if (
+            self.learning_mode == "on_policy"
+            and self.minibatch_size > self.rollout_batch_size
+        ):
             raise ValueError(
                 "minibatch_size cannot exceed the fresh rollout batch size"
             )
-        if self.rollout_batch_size % self.minibatch_size:
+        if (
+            self.learning_mode == "on_policy"
+            and self.rollout_batch_size % self.minibatch_size
+        ):
             raise ValueError(
                 "num_envs * rollout_steps must be divisible by minibatch_size"
             )
@@ -381,6 +465,14 @@ class M4POConfig:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    @classmethod
+    def from_checkpoint_dict(cls, data: dict[str, Any]) -> "M4POConfig":
+        """Checkpoints predating the mode field always used fresh-rollout PPO."""
+
+        values = dict(data)
+        values.setdefault("learning_mode", "on_policy")
+        return cls(**values)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "M4POConfig":

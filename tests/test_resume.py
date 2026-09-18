@@ -27,6 +27,7 @@ def test_setup_failure_closes_environment_and_logger(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = M4POConfig.from_yaml("m4po/configs/mock_smoke.yaml")
+    cfg.learning_mode = "on_policy"
     cfg.total_steps = cfg.rollout_batch_size
     cfg.log_dir = str(tmp_path / "setup_failure")
     environment = trainer_module.make_vector_env(cfg)
@@ -71,6 +72,7 @@ def test_interrupted_partial_rollout_resumes_from_completed_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = M4POConfig.from_yaml("m4po/configs/mock_smoke.yaml")
+    cfg.learning_mode = "on_policy"
     cfg.total_steps = cfg.rollout_batch_size
     cfg.save_every = 0
     cfg.log_every = 0
@@ -98,6 +100,7 @@ def test_interrupted_partial_rollout_resumes_from_completed_boundary(
 
     monkeypatch.setattr(M4POAgent, "act_np", original_act_np)
     resumed = M4POConfig.from_yaml("m4po/configs/mock_smoke.yaml")
+    resumed.learning_mode = "on_policy"
     resumed.total_steps = resumed.rollout_batch_size
     resumed.save_every = 0
     resumed.log_every = 0
@@ -111,6 +114,7 @@ def test_interrupted_partial_rollout_resumes_from_completed_boundary(
 
 def test_resume_payload_rejects_mismatch_and_unsafe_boundaries() -> None:
     cfg = M4POConfig.from_yaml("m4po/configs/mock_smoke.yaml")
+    cfg.learning_mode = "on_policy"
     cfg.total_steps = cfg.rollout_batch_size
     payload = {
         "implementation_id": IMPLEMENTATION_ID,
@@ -149,6 +153,7 @@ def test_resume_payload_rejects_mismatch_and_unsafe_boundaries() -> None:
 
 def test_boundary_resume_reproduces_uninterrupted_parameters(tmp_path: Path) -> None:
     cfg = M4POConfig.from_yaml("m4po/configs/mock_smoke.yaml")
+    cfg.learning_mode = "on_policy"
     cfg.total_steps = 2 * cfg.rollout_batch_size
     cfg.eval_every = 0
     cfg.save_every = cfg.rollout_batch_size
@@ -183,6 +188,7 @@ def test_boundary_resume_reproduces_uninterrupted_parameters(tmp_path: Path) -> 
 
 def test_periodic_evaluation_does_not_change_training_rng(tmp_path: Path) -> None:
     baseline = M4POConfig.from_yaml("m4po/configs/mock_smoke.yaml")
+    baseline.learning_mode = "on_policy"
     baseline.total_steps = 2 * baseline.rollout_batch_size
     baseline.eval_every = 0
     baseline.save_every = 0
